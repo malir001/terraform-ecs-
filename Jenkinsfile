@@ -3,72 +3,99 @@ pipeline {
 
     environment {
         AWS_REGION = 'ap-south-1'
-        ECR_REPO = 'my-ecr-repo'
-        IMAGE_TAG = 'latest'
-        AWS_CREDENTIALS_ID = 'aws-ecr-creds' // This must match the ID set in Jenkins > Credentials
+        ECR_REPO_NAME = '203918866361.dkr.ecr.ap-south-1.amazonaws.com/myapp'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        GITHUB_CREDS = 'github-https-creds'       // Jenkins credential ID for GitHub PAT
+        AWS_CREDS = 'aws-ecr-creds'               // Jenkins credential ID for AWS IAM access key
     }
 
     stages {
-        stage('Checkout') {
+
+        stage('Checkout Code') {
             steps {
-                git credentialsId: "${AWS_CREDENTIALS_ID}", url: 'https://github.com/malir001/terraform-ecs.git', branch: 'main'
+                git credentialsId: "${GITHUB_CREDS}", url: 'https://github.com/malir001/terraform-ecs.git', branch: 'master'
             }
         }
 
-        stage('Build') {
+        stage('Terraform Init & Plan') {
             steps {
-                sh 'mvn clean package -DskipTests'
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDS}"
+                ]]) {
+                    sh '''
+                        cd terraform
+                        terraform init
+                        terraform plan -out=tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDS}"
+                ]]) {
+                    sh '''
+                        cd terraform
+                        terraform apply -auto-approve tfplan
+                    '''
+                }
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 script {
-                    sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+                    sh """
+                        docker build -t ${ECR_REPO_NAME}:${IMAGE_TAG} .
+                    """
                 }
             }
         }
 
         stage('Login to ECR') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: "${AWS_CREDENTIALS_ID}"]]) {
-                    script {
-                        def accountId = sh(script: "aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
-                        def repoUri = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-                        sh """
-                            aws ecr get-login-password --region ${AWS_REGION} | \
-                            docker login --username AWS --password-stdin ${repoUri}
-                        """
-                    }
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDS}"
+                ]]) {
+                    sh '''
+                        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+                    '''
                 }
             }
         }
 
-        stage('Push to ECR') {
+        stage('Push Docker Image to ECR') {
             steps {
                 script {
                     def accountId = sh(script: "aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
-                    def repoUri = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+                    def ecrRepoUri = "${accountId}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
 
                     sh """
-                        docker tag ${ECR_REPO}:${IMAGE_TAG} ${repoUri}:${IMAGE_TAG}
-                        docker push ${repoUri}:${IMAGE_TAG}
+                        docker tag ${ECR_REPO_NAME}:${IMAGE_TAG} ${ecrRepoUri}:${IMAGE_TAG}
+                        docker push ${ecrRepoUri}:${IMAGE_TAG}
                     """
                 }
             }
         }
 
-        stage('Terraform Init & Apply') {
+        stage('Deploy to ECS') {
             steps {
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                                  credentialsId: "${AWS_CREDENTIALS_ID}"]]) {
-                    sh """
-                        cd terraform
-                        terraform init
-                        terraform apply -auto-approve
-                    """
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDS}"
+                ]]) {
+                    sh '''
+                        aws ecs update-service \
+                          --cluster your-ecs-cluster-name \
+                          --service your-ecs-service-name \
+                          --force-new-deployment \
+                          --region $AWS_REGION
+                    '''
                 }
             }
         }
@@ -76,10 +103,10 @@ pipeline {
 
     post {
         failure {
-            echo 'Pipeline failed.'
+            echo '❌ Pipeline failed.'
         }
         success {
-            echo 'Pipeline completed successfully.'
+            echo '✅ Deployment complete.'
         }
     }
 }
