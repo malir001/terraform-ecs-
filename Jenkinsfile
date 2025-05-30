@@ -3,26 +3,19 @@ pipeline {
 
     environment {
         AWS_REGION = 'ap-south-1'
-        ECR_REPO = '203918866361.dkr.ecr.ap-south-1.amazonaws.com/myapp'
+        ECR_REPO = 'my-ecr-repo'
         IMAGE_TAG = 'latest'
-        GIT_CREDENTIALS_ID = 'github-creds'
-        AWS_CREDENTIALS_ID = 'aws-ecr-creds'
+        AWS_CREDENTIALS_ID = 'aws-ecr-creds' // This must match the ID set in Jenkins > Credentials
     }
 
     stages {
         stage('Checkout') {
             steps {
-                checkout([$class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/malir001/terraform-ecs.git',
-                        credentialsId: "${GIT_CREDENTIALS_ID}"
-                    ]]
-                ])
+                git credentialsId: "${AWS_CREDENTIALS_ID}", url: 'https://github.com/malir001/terraform-ecs.git', branch: 'main'
             }
         }
 
-        stage('Build with Maven') {
+        stage('Build') {
             steps {
                 sh 'mvn clean package -DskipTests'
             }
@@ -31,7 +24,7 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 script {
-                    dockerImage = docker.build("${ECR_REPO}:${IMAGE_TAG}")
+                    sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
                 }
             }
         }
@@ -40,10 +33,15 @@ pipeline {
             steps {
                 withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
                                   credentialsId: "${AWS_CREDENTIALS_ID}"]]) {
-                    sh """
-                        aws ecr get-login-password --region $AWS_REGION | \
-                        docker login --username AWS --password-stdin $(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
-                    """
+                    script {
+                        def accountId = sh(script: "aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
+                        def repoUri = "${accountId}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                        sh """
+                            aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${repoUri}
+                        """
+                    }
                 }
             }
         }
@@ -69,7 +67,6 @@ pipeline {
                     sh """
                         cd terraform
                         terraform init
-                        terraform plan
                         terraform apply -auto-approve
                     """
                 }
@@ -79,10 +76,10 @@ pipeline {
 
     post {
         failure {
-            echo 'Build failed!'
+            echo 'Pipeline failed.'
         }
         success {
-            echo 'Build succeeded!'
+            echo 'Pipeline completed successfully.'
         }
     }
 }
